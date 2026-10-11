@@ -1,0 +1,6 @@
+requests
+python-dotenv
+feedparser
+youtube-transcript-api
+yt-dlp
+google-genai

@@ -1,0 +1,39 @@
+name: YouTube to Notion Auto Sync
+
+on:
+  schedule:
+    # GitHub Actions 使用 UTC 時間：
+    # UTC 00:00 = 台灣時間 08:00
+    # UTC 08:00 = 台灣時間 16:00
+    - cron: '0 0,8 * * *'
+  # 支援在 GitHub 網頁上手動點擊立即執行（測試用）
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 簽出專案代碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安裝相依套件
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 執行巡邏與 Notion 同步
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          GEMINI_MODELS: ${{ secrets.GEMINI_MODELS }}
+          AI_PROMPT_TEMPLATES: ${{ secrets.AI_PROMPT_TEMPLATES }}
+        run: |
+          python main.py
