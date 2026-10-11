@@ -5,9 +5,9 @@ import time
 import random
 import datetime
 from typing import List, Dict, Optional
+import xml.etree.ElementTree as ET
 import requests
 import feedparser
-import yt_dlp
 from dotenv import load_dotenv
 from youtube_transcript_api import YouTubeTranscriptApi
 from google import genai
@@ -30,9 +30,8 @@ NOTION_HEADERS = {
     "Notion-Version": "2022-06-28"
 }
 
+# 乾淨的請求 Session，不放可能導致 Google 轉址的 CONSENT Cookie
 session = requests.Session()
-session.cookies.set("SOCS", "CAESEwgDEgk0ODEzNzk5NDIaAnpoIAEaBgiA_LyaBg", domain=".youtube.com")
-session.cookies.set("CONSENT", "PENDING+999", domain=".youtube.com")
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7"
@@ -177,9 +176,9 @@ def create_summary_notion_page(video_id: str, title: str, url: str, channel_name
 
     resp = requests.post(endpoint, headers=NOTION_HEADERS, json=body)
     if resp.status_code == 200:
-        print(f"    └─ 成功收錄至 Notion，並完成【{category}】結構化總結！")
+        print(f"    └─ ✅ 成功收錄至 Notion，完成【{category}】結構化總結！", flush=True)
     else:
-        print(f"    └─ Notion 寫入失敗: {resp.status_code} - {resp.text}")
+        print(f"    └─ ❌ Notion 寫入失敗: {resp.status_code} - {resp.text}", flush=True)
 
 def parse_iso_datetime(dt_str: str) -> Optional[datetime.datetime]:
     if not dt_str:
@@ -200,57 +199,60 @@ def parse_iso_datetime(dt_str: str) -> Optional[datetime.datetime]:
         pass
     return None
 
-def get_video_real_upload_date(video_id: str) -> datetime.datetime:
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    try:
-        resp = session.get(url, timeout=6)
-        if resp.status_code == 200:
-            patterns = [
-                r'itemprop="datePublished"\s+content="([^"]+)"',
-                r'itemprop="uploadDate"\s+content="([^"]+)"',
-                r'"publishDate":"([^"]+)"',
-                r'"uploadDate":"([^"]+)"'
-            ]
-            for pat in patterns:
-                m = re.search(pat, resp.text)
-                if m:
-                    parsed = parse_iso_datetime(m.group(1))
-                    if parsed:
-                        return parsed
-    except Exception:
-        pass
-
-    try:
-        with yt_dlp.YoutubeDL({'quiet': True, 'skip_download': True, 'no_warnings': True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if info:
-                ts = info.get("timestamp") or info.get("release_timestamp")
-                if ts:
-                    return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
-                up_date = info.get("upload_date")
-                if up_date and len(up_date) == 8:
-                    dt = datetime.datetime.strptime(up_date, "%Y%m%d")
-                    return dt.replace(tzinfo=datetime.timezone.utc)
-    except Exception:
-        pass
-
-    return datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
-
 def fetch_videos_via_rss(channel_id: str) -> List[Dict]:
+    """使用原生 XML 解析 YouTube 官方 RSS，極速、秒級發布時間且 100% 免遭機器人驗證"""
     if not channel_id:
         return []
     rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
     try:
-        # 使用帶有瀏覽器標頭的 Session 讀取，徹底避免 YouTube 回傳 403 阻擋
         resp = session.get(rss_url, timeout=10)
-        if resp.status_code != 200:
-            print(f"  ⚠️ RSS HTTP 狀態異常：{resp.status_code}")
+        if resp.status_code != 200 or not resp.content:
+            print(f"  ⚠️ RSS HTTP 回應異常：{resp.status_code}", flush=True)
             return []
 
-        feed = feedparser.parse(resp.content)
-        if not feed.entries:
-            return []
+        # 優先使用 Python 內建 ElementTree 解析標準 Atom XML
+        root = ET.fromstring(resp.content)
+        ns = {
+            "atom": "http://www.w3.org/2005/Atom",
+            "yt": "http://www.youtube.com/xml/schemas/2015",
+            "media": "http://search.yahoo.com/mrss/"
+        }
+        
+        videos = []
+        for entry in root.findall("atom:entry", ns)[:10]:
+            v_id_node = entry.find("yt:videoId", ns)
+            title_node = entry.find("atom:title", ns)
+            pub_node = entry.find("atom:published", ns)
+            desc_node = entry.find("media:group/media:description", ns)
 
+            v_id = v_id_node.text.strip() if v_id_node is not None and v_id_node.text else ""
+            title = title_node.text.strip() if title_node is not None and title_node.text else ""
+            pub_str = pub_node.text.strip() if pub_node is not None and pub_node.text else ""
+            desc = desc_node.text.strip() if desc_node is not None and desc_node.text else ""
+
+            if not v_id:
+                continue
+
+            pub_dt = parse_iso_datetime(pub_str)
+            if not pub_dt:
+                pub_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
+
+            videos.append({
+                "id": v_id,
+                "title": title,
+                "url": f"https://www.youtube.com/watch?v={v_id}",
+                "description": desc or "",
+                "published_dt": pub_dt,
+                "published_str": pub_dt.strftime("%Y-%m-%d")
+            })
+            
+        return videos
+    except Exception as e:
+        print(f"  ⚠️ 原生 XML 解析異常：{e}，嘗試 feedparser 備援...", flush=True)
+
+    # 備援：feedparser
+    try:
+        feed = feedparser.parse(rss_url)
         videos = []
         for entry in feed.entries[:10]:
             v_id = entry.get("yt_videoid")
@@ -258,7 +260,6 @@ def fetch_videos_via_rss(channel_id: str) -> List[Dict]:
                 link = entry.get("link", "")
                 m = re.search(r'v=([a-zA-Z0-9_-]{11})', link)
                 v_id = m.group(1) if m else None
-
             if not v_id:
                 continue
 
@@ -266,98 +267,32 @@ def fetch_videos_via_rss(channel_id: str) -> List[Dict]:
             pub_dt = parse_iso_datetime(pub_str)
             if not pub_dt and hasattr(entry, "published_parsed") and entry.published_parsed:
                 pub_dt = datetime.datetime(*entry.published_parsed[:6], tzinfo=datetime.timezone.utc)
-
             if not pub_dt:
                 pub_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
-
-            desc = entry.get("summary", "")
-            if not desc and "media_group" in entry:
-                desc = entry.get("media_group", {}).get("media_description", "")
 
             videos.append({
                 "id": v_id,
                 "title": entry.get("title", ""),
                 "url": f"https://www.youtube.com/watch?v={v_id}",
-                "description": desc or "",
+                "description": entry.get("summary", ""),
                 "published_dt": pub_dt,
                 "published_str": pub_dt.strftime("%Y-%m-%d")
             })
         return videos
-    except Exception as e:
-        print(f"  ⚠️ RSS 抓取發生例外：{e}")
+    except Exception:
         return []
-
-def extract_channel_videos_via_ytdlp(channel_target: str) -> List[Dict]:
-    target = channel_target.strip()
-    if target.startswith("http"):
-        url = target
-    elif target.startswith("@"):
-        url = f"https://www.youtube.com/{target}/videos"
-    elif target.startswith("UC") and len(target) == 24:
-        url = f"https://www.youtube.com/channel/{target}/videos"
-    else:
-        url = f"https://www.youtube.com/@{target}/videos"
-
-    ydl_opts = {
-        'playlistend': 10,
-        'quiet': True,
-        'no_warnings': True,
-        'ignoreerrors': True,
-        'skip_download': True,
-        'extract_flat': True,
-        'http_headers': {
-            'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-        },
-        'extractor_args': {'youtube': {'lang': ['zh-TW', 'zh-Hant']}}
-    }
-
-    raw_videos = []
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not info:
-                return []
-            for e in info.get('entries', []):
-                if not e:
-                    continue
-                v_id = e.get('id')
-                title = e.get('title')
-                if not v_id or not title:
-                    continue
-                raw_videos.append({
-                    "id": v_id,
-                    "title": title,
-                    "url": f"https://www.youtube.com/watch?v={v_id}",
-                    "description": e.get('description', '') or ""
-                })
-    except Exception as e:
-        print(f"  └─ 擷取清單異常：{e}")
-        return []
-
-    final_videos = []
-    for item in raw_videos:
-        real_dt = get_video_real_upload_date(item["id"])
-        item["published_dt"] = real_dt
-        item["published_str"] = real_dt.strftime("%Y-%m-%d")
-        final_videos.append(item)
-        time.sleep(0.1)
-
-    return final_videos
 
 def get_channel_videos(ch: Dict) -> List[Dict]:
     channel_id = ch.get("id")
     videos = []
+    
     if channel_id and channel_id.startswith("UC"):
         videos = fetch_videos_via_rss(channel_id)
         if videos:
-            print(f"  📡 RSS 成功取得 {len(videos)} 部最新影片資訊")
+            print(f"  📡 RSS 成功取得 {len(videos)} 部最新影片資訊", flush=True)
 
     if not videos:
-        target = ch.get("handle") or ch.get("url") or ch.get("id")
-        videos = extract_channel_videos_via_ytdlp(target)
-
-    if not videos:
+        print("  ⚠️ RSS 無法取得該頻道影片，略過。", flush=True)
         return []
 
     videos.sort(key=lambda x: x["published_dt"], reverse=True)
@@ -369,7 +304,7 @@ def get_channel_videos(ch: Dict) -> List[Dict]:
     ]
 
     if not recent_2_days and videos:
-        print(f"  ℹ️ 最近一部影片上架日期為：{videos[0]['published_str']}（超過 48 小時範圍）")
+        print(f"  ℹ️ 最近一部影片上架日期為：{videos[0]['published_str']}（超過 48 小時範圍）", flush=True)
 
     return recent_2_days
 
@@ -426,7 +361,7 @@ def summarize_content(title: str, text_content: str, templates: Dict[str, str], 
 
     for model_name in models:
         try:
-            print(f"    ↳ 調用模型：{model_name} 產出筆記中...")
+            print(f"    ↳ 調用模型：{model_name} 產出筆記中...", flush=True)
             config = types.GenerateContentConfig(temperature=0.3)
             response = ai_client.models.generate_content(
                 model=model_name,
@@ -447,23 +382,23 @@ def summarize_content(title: str, text_content: str, templates: Dict[str, str], 
         except Exception as e:
             err_msg = str(e)
             if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                print(f"    ⚠️ [{model_name}] 配額限制 (429)，自動降級切換至下一個模型...")
+                print(f"    ⚠️ [{model_name}] 配額限制 (429)，自動降級切換至下一個模型...", flush=True)
                 time.sleep(1.5)
                 continue
             else:
-                print(f"    ⚠️ [{model_name}] 異常：{e}")
+                print(f"    ⚠️ [{model_name}] 異常：{e}", flush=True)
                 time.sleep(1.0)
                 continue
 
     raise RuntimeError("所有設定的備用模型皆已嘗試完畢，配額耗盡。")
 
 def main():
-    print("=" * 65)
-    print("  YouTube 智慧資訊匯流 - 一鍵全自動巡邏與 AI 總結")
-    print("=" * 65)
+    print("=" * 65, flush=True)
+    print("  YouTube 智慧資訊匯流 - 一鍵全自動巡邏與 AI 總結", flush=True)
+    print("=" * 65, flush=True)
 
     if not os.path.exists("channels.json"):
-        print("❌ 找不到 channels.json 設定檔！")
+        print("❌ 找不到 channels.json 設定檔！", flush=True)
         return
 
     with open("channels.json", "r", encoding="utf-8") as f:
@@ -476,21 +411,21 @@ def main():
 
     for ch in channels:
         name = ch["name"]
-        print(f"\n📡 正在巡邏頻道：{name} ...")
+        print(f"\n📡 正在巡邏頻道：{name} ...", flush=True)
         time.sleep(random.uniform(0.8, 1.2))
 
         target_videos = get_channel_videos(ch)
 
         if not target_videos:
-            print("  💤 最近 2 天內無新影片，略過。")
+            print("  💤 最近 2 天內無新影片，略過。", flush=True)
             continue
 
         for v in target_videos:
             if check_notion_exists(v["url"]):
-                print(f"  ⏭️ [已存在略過]：{v['title']}")
+                print(f"  ⏭️ [已存在略過]：{v['title']}", flush=True)
                 continue
 
-            print(f"\n  🎯 [發現新影片]：{v['title']} ({v['published_str']})")
+            print(f"\n  🎯 [發現新影片]：{v['title']} ({v['published_str']})", flush=True)
             
             transcript_text = get_transcript(v["id"])
             if transcript_text:
@@ -515,11 +450,11 @@ def main():
                 total_added += 1
                 time.sleep(2.0)
             except Exception as e:
-                print(f"    ❌ 處理該影片時發生錯誤：{e}")
+                print(f"    ❌ 處理該影片時發生錯誤：{e}", flush=True)
 
-    print("\n" + "=" * 65)
-    print(f"🎉 任務完成！本次共發現並處理 {total_added} 部新影片至 Notion。")
-    print("=" * 65)
+    print("\n" + "=" * 65, flush=True)
+    print(f"🎉 任務完成！本次共發現並處理 {total_added} 部新影片至 Notion。", flush=True)
+    print("=" * 65, flush=True)
 
 if __name__ == "__main__":
     main()
