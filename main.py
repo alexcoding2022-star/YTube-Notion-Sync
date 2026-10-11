@@ -198,15 +198,36 @@ def parse_iso_datetime(dt_str: str) -> Optional[datetime.datetime]:
         pass
     return None
 
-def fetch_videos_via_rss(channel_id: str) -> List[Dict]:
-    """雙重 RSS 端點嘗試：1. channel_id, 2. playlist_id=UU..."""
-    if not channel_id or not channel_id.startswith("UC"):
-        return []
+def get_video_real_date(video_id: str) -> Optional[datetime.datetime]:
+    """透過純 HTTP 輕量取得影片真實發布日期（不透過 yt-dlp，徹底避開 Bot Check）"""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        resp = session.get(url, timeout=8)
+        if resp.status_code == 200 and "consent.youtube.com" not in resp.url:
+            patterns = [
+                r'itemprop=["\']datePublished["\']\s+content=["\']([^"\']+)["\']',
+                r'["\']publishDate["\']\s*:\s*["\']([^"\']+)["\']',
+                r'itemprop=["\']uploadDate["\']\s+content=["\']([^"\']+)["\']',
+                r'["\']uploadDate["\']\s*:\s*["\']([^"\']+)["\']'
+            ]
+            for pat in patterns:
+                m = re.search(pat, resp.text)
+                if m:
+                    dt = parse_iso_datetime(m.group(1))
+                    if dt:
+                        return dt
+    except Exception:
+        pass
+    return None
 
-    urls_to_try = [
-        f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}",
-        f"https://www.youtube.com/feeds/videos.xml?playlist_id=UU{channel_id[2:]}"
-    ]
+def fetch_videos_via_rss(url_or_id: str) -> List[Dict]:
+    """支援直接傳入完整 RSS URL，或 Channel ID (UC...) 自動測試兩種端點"""
+    urls_to_try = []
+    if url_or_id.startswith("http"):
+        urls_to_try.append(url_or_id)
+    elif url_or_id.startswith("UC"):
+        urls_to_try.append(f"https://www.youtube.com/feeds/videos.xml?channel_id={url_or_id}")
+        urls_to_try.append(f"https://www.youtube.com/feeds/videos.xml?playlist_id=UU{url_or_id[2:]}")
 
     for rss_url in urls_to_try:
         try:
@@ -257,7 +278,7 @@ def fetch_videos_via_rss(channel_id: str) -> List[Dict]:
     return []
 
 def extract_channel_videos_via_ytdlp(channel_target: str) -> List[Dict]:
-    """輕量頻道解析：直接自頻道頁面獲取時間，絕不單獨訪問影片網址，徹底避開機器人驗證"""
+    """自頻道頁面提取影片列表，並以純 HTTP 解析真實影片日期"""
     target = channel_target.strip()
     if target.startswith("http"):
         url = target if "/videos" in target else f"{target.rstrip('/')}/videos"
@@ -278,10 +299,6 @@ def extract_channel_videos_via_ytdlp(channel_target: str) -> List[Dict]:
         'http_headers': {
             'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-        },
-        'extractor_args': {
-            'youtube': {'lang': ['zh-TW', 'zh-Hant']},
-            'youtubetab': {'approximate_date': ['true']}
         }
     }
 
@@ -292,7 +309,6 @@ def extract_channel_videos_via_ytdlp(channel_target: str) -> List[Dict]:
             if not info:
                 return []
             
-            now = datetime.datetime.now(datetime.timezone.utc)
             for e in info.get('entries', []):
                 if not e:
                     continue
@@ -301,29 +317,21 @@ def extract_channel_videos_via_ytdlp(channel_target: str) -> List[Dict]:
                 if not v_id or not title:
                     continue
 
-                # 直接自列表提取時間，不進行個別網址訪問
-                ts = e.get('timestamp') or e.get('release_timestamp')
-                pub_dt = None
-                if ts:
-                    pub_dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
-                elif e.get('upload_date') and len(e.get('upload_date')) == 8:
-                    try:
-                        pub_dt = datetime.datetime.strptime(e.get('upload_date'), "%Y%m%d").replace(tzinfo=datetime.timezone.utc)
-                    except Exception:
-                        pub_dt = None
-
-                # 若無時間資料，預設為當前時間以確保納入檢查
-                if not pub_dt:
-                    pub_dt = now
+                # 透過輕量 HTTP 抓取每部影片的真實發布日期
+                real_dt = get_video_real_date(v_id)
+                if not real_dt:
+                    # 若臨時未取到，保守設定為 3 天前避免誤判為今日
+                    real_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=3)
 
                 final_videos.append({
                     "id": v_id,
                     "title": title,
                     "url": f"https://www.youtube.com/watch?v={v_id}",
                     "description": e.get('description', '') or "",
-                    "published_dt": pub_dt,
-                    "published_str": pub_dt.strftime("%Y-%m-%d")
+                    "published_dt": real_dt,
+                    "published_str": real_dt.strftime("%Y-%m-%d")
                 })
+                time.sleep(0.2)
     except Exception as e:
         print(f"  └─ 輕量頻道解析異常：{e}", flush=True)
         return []
@@ -331,23 +339,28 @@ def extract_channel_videos_via_ytdlp(channel_target: str) -> List[Dict]:
     return final_videos
 
 def get_channel_videos(ch: Dict) -> List[Dict]:
-    channel_id = ch.get("id")
+    """支援 handle, id, url, rss_url 全面解析"""
     videos = []
 
-    # 策略 1：嘗試 RSS 端點
-    if channel_id and channel_id.startswith("UC"):
-        videos = fetch_videos_via_rss(channel_id)
-        if videos:
-            print(f"  📡 RSS 成功取得 {len(videos)} 部最新影片資訊", flush=True)
+    # 1. 若有提供 rss_url，優先嘗試直接讀取
+    if ch.get("rss_url"):
+        videos = fetch_videos_via_rss(ch["rss_url"])
 
-    # 策略 2：若 RSS 回傳 404，無縫切換到輕量頻道解析（無 Bot Check）
+    # 2. 若無或失敗，嘗試透過 id 讀取 RSS (channel_id 或 uploads playlist)
+    if not videos and ch.get("id"):
+        videos = fetch_videos_via_rss(ch["id"])
+
+    if videos:
+        print(f"  📡 RSS 成功取得 {len(videos)} 部最新影片資訊", flush=True)
+
+    # 3. 若 RSS 遭遇 404，由 url / handle / id 自動導向輕量頻道解析
     if not videos:
-        target = ch.get("url") or ch.get("handle") or (f"https://www.youtube.com/channel/{channel_id}" if channel_id else "")
+        target = ch.get("url") or ch.get("handle") or (f"https://www.youtube.com/channel/{ch.get('id')}" if ch.get('id') else "")
         if target:
-            print(f"  🔄 RSS 回應 404，切換至輕量頻道解析：{target} ...", flush=True)
+            print(f"  🔄 切換至頻道輕量解析：{target} ...", flush=True)
             videos = extract_channel_videos_via_ytdlp(target)
             if videos:
-                print(f"  ✅ 輕量解析成功取得 {len(videos)} 部影片", flush=True)
+                print(f"  ✅ 輕量解析成功取得 {len(videos)} 部影片（含精準發布日期）", flush=True)
 
     if not videos:
         return []
@@ -355,6 +368,7 @@ def get_channel_videos(ch: Dict) -> List[Dict]:
     videos.sort(key=lambda x: x["published_dt"], reverse=True)
     now = datetime.datetime.now(datetime.timezone.utc)
 
+    # 嚴格篩選最近 48 小時內之新影片
     recent_2_days = [
         v for v in videos 
         if -86400 <= (now - v["published_dt"]).total_seconds() <= 172800
@@ -438,8 +452,8 @@ def summarize_content(title: str, text_content: str, templates: Dict[str, str], 
             return {"category": category, "summary": summary}
         except Exception as e:
             err_msg = str(e)
-            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                print(f"    ⚠️ [{model_name}] 配額限制 (429)，自動降級切換至下一個模型...", flush=True)
+            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "disconnected" in err_msg.lower():
+                print(f"    ⚠️ [{model_name}] 異常，自動降級切換至備用模型...", flush=True)
                 time.sleep(1.5)
                 continue
             else:
@@ -467,7 +481,7 @@ def main():
     total_added = 0
 
     for ch in channels:
-        name = ch["name"]
+        name = ch.get("name", "未命名頻道")
         print(f"\n📡 正在巡邏頻道：{name} ...", flush=True)
         time.sleep(random.uniform(0.8, 1.2))
 
