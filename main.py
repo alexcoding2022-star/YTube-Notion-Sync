@@ -20,7 +20,7 @@ NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 
 if not GEMINI_API_KEY or not NOTION_API_KEY or not NOTION_DATABASE_ID:
-    raise ValueError("環境變數不足！請檢查 .env 檔案中的金鑰與 NOTION_DATABASE_ID！")
+    raise ValueError("環境變數不足！請檢查 .env 或 GitHub Secrets 中的金鑰與 NOTION_DATABASE_ID！")
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -40,9 +40,6 @@ session.headers.update({
 
 DB_SCHEMA = None
 
-# ==========================================
-# 1. 範本與模型設定加載 (支援單一 .env)
-# ==========================================
 def load_model_list() -> List[str]:
     models_env = os.getenv("GEMINI_MODELS", "")
     if models_env.strip():
@@ -82,9 +79,6 @@ def load_prompt_templates() -> Dict[str, str]:
         "通用知識類": "1. 【核心概念】：用一句話闡述底層邏輯。\n2. 【三大關鍵思維】：梳理 3 個最具啟發性觀點。\n3. 【生活與工作應用】：列出具體行動步驟。"
     }
 
-# ==========================================
-# 2. Notion 資料庫輔助函式
-# ==========================================
 def get_db_schema() -> Dict:
     global DB_SCHEMA
     if DB_SCHEMA is not None:
@@ -187,9 +181,6 @@ def create_summary_notion_page(video_id: str, title: str, url: str, channel_name
     else:
         print(f"    └─ Notion 寫入失敗: {resp.status_code} - {resp.text}")
 
-# ==========================================
-# 3. YouTube 影片抓取與逐字稿抽取
-# ==========================================
 def parse_iso_datetime(dt_str: str) -> Optional[datetime.datetime]:
     if not dt_str:
         return None
@@ -250,9 +241,16 @@ def fetch_videos_via_rss(channel_id: str) -> List[Dict]:
         return []
     rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
     try:
-        feed = feedparser.parse(rss_url)
+        # 使用帶有瀏覽器標頭的 Session 讀取，徹底避免 YouTube 回傳 403 阻擋
+        resp = session.get(rss_url, timeout=10)
+        if resp.status_code != 200:
+            print(f"  ⚠️ RSS HTTP 狀態異常：{resp.status_code}")
+            return []
+
+        feed = feedparser.parse(resp.content)
         if not feed.entries:
             return []
+
         videos = []
         for entry in feed.entries[:10]:
             v_id = entry.get("yt_videoid")
@@ -272,16 +270,21 @@ def fetch_videos_via_rss(channel_id: str) -> List[Dict]:
             if not pub_dt:
                 pub_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
 
+            desc = entry.get("summary", "")
+            if not desc and "media_group" in entry:
+                desc = entry.get("media_group", {}).get("media_description", "")
+
             videos.append({
                 "id": v_id,
                 "title": entry.get("title", ""),
                 "url": f"https://www.youtube.com/watch?v={v_id}",
-                "description": entry.get("summary", ""),
+                "description": desc or "",
                 "published_dt": pub_dt,
                 "published_str": pub_dt.strftime("%Y-%m-%d")
             })
         return videos
-    except Exception:
+    except Exception as e:
+        print(f"  ⚠️ RSS 抓取發生例外：{e}")
         return []
 
 def extract_channel_videos_via_ytdlp(channel_target: str) -> List[Dict]:
@@ -347,20 +350,27 @@ def get_channel_videos(ch: Dict) -> List[Dict]:
     videos = []
     if channel_id and channel_id.startswith("UC"):
         videos = fetch_videos_via_rss(channel_id)
+        if videos:
+            print(f"  📡 RSS 成功取得 {len(videos)} 部最新影片資訊")
+
     if not videos:
         target = ch.get("handle") or ch.get("url") or ch.get("id")
         videos = extract_channel_videos_via_ytdlp(target)
+
     if not videos:
         return []
 
     videos.sort(key=lambda x: x["published_dt"], reverse=True)
     now = datetime.datetime.now(datetime.timezone.utc)
     
-    # 嚴格篩選最近 2 天（48小時內，含-86400s時差容錯）
     recent_2_days = [
         v for v in videos 
         if -86400 <= (now - v["published_dt"]).total_seconds() <= 172800
     ]
+
+    if not recent_2_days and videos:
+        print(f"  ℹ️ 最近一部影片上架日期為：{videos[0]['published_str']}（超過 48 小時範圍）")
+
     return recent_2_days
 
 def get_transcript(video_id: str) -> Optional[str]:
@@ -394,9 +404,6 @@ def get_transcript(video_id: str) -> Optional[str]:
         pass
     return None
 
-# ==========================================
-# 4. Gemini AI 總結生成
-# ==========================================
 def summarize_content(title: str, text_content: str, templates: Dict[str, str], models: List[str]) -> Dict[str, str]:
     template_instructions = "\n\n".join([f"### 分類【{k}】之標準結構：\n{v}" for k, v in templates.items()])
 
@@ -450,9 +457,6 @@ def summarize_content(title: str, text_content: str, templates: Dict[str, str], 
 
     raise RuntimeError("所有設定的備用模型皆已嘗試完畢，配額耗盡。")
 
-# ==========================================
-# 5. 主流程：一鍵巡邏、檢測與批次總結
-# ==========================================
 def main():
     print("=" * 65)
     print("  YouTube 智慧資訊匯流 - 一鍵全自動巡邏與 AI 總結")
@@ -488,7 +492,6 @@ def main():
 
             print(f"\n  🎯 [發現新影片]：{v['title']} ({v['published_str']})")
             
-            # 取得逐字稿或簡介
             transcript_text = get_transcript(v["id"])
             if transcript_text:
                 raw_content = f"【字幕內容】\n{transcript_text}"
@@ -499,9 +502,7 @@ def main():
                 raw_content = f"標題：{v['title']}（無字幕且簡介過短）"
 
             try:
-                # 產出 AI 筆記
                 res = summarize_content(v["title"], raw_content, templates, models)
-                # 寫入 Notion
                 create_summary_notion_page(
                     v["id"], 
                     v["title"], 
@@ -512,7 +513,7 @@ def main():
                     res["summary"]
                 )
                 total_added += 1
-                time.sleep(2.0)  # 保持適度請求間隔避免 API 頻繁
+                time.sleep(2.0)
             except Exception as e:
                 print(f"    ❌ 處理該影片時發生錯誤：{e}")
 
