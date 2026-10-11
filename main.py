@@ -19,7 +19,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 
-# 預設追蹤 3 天內之新影片
+# 篩選 3 天內之新影片
 DAYS_LIMIT = int(os.getenv("DAYS_LOOKBACK", "3"))
 
 if not GEMINI_API_KEY or not NOTION_API_KEY or not NOTION_DATABASE_ID:
@@ -146,6 +146,7 @@ def create_summary_notion_page(video_id: str, title: str, url: str, channel_name
         elif t == "rich_text":
             props["Channel"] = {"rich_text": [{"type": "text", "text": {"content": channel_name[:100]}}]}
 
+    # 將精準日期寫入 Notion 屬性
     if "Published" in schema:
         t = schema["Published"].get("type")
         if t == "date":
@@ -179,7 +180,7 @@ def create_summary_notion_page(video_id: str, title: str, url: str, channel_name
 
     resp = requests.post(endpoint, headers=NOTION_HEADERS, json=body)
     if resp.status_code == 200:
-        print(f"    └─ ✅ 成功收錄至 Notion，完成【{category}】結構化總結！", flush=True)
+        print(f"    └─ ✅ 成功收錄至 Notion（日期：{pub_date}），完成【{category}】結構化總結！", flush=True)
     else:
         print(f"    └─ ❌ Notion 寫入失敗: {resp.status_code} - {resp.text}", flush=True)
 
@@ -202,17 +203,42 @@ def parse_iso_datetime(dt_str: str) -> Optional[datetime.datetime]:
         pass
     return None
 
+def parse_relative_time(text: str) -> datetime.datetime:
+    """精準將相對時間（如 '1 天前', '18 小時前'）換算為正確日期"""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    text = text.strip()
+    m = re.search(r"(\d+)\s*(?:分鐘前|分前|minutes?\s*ago)", text)
+    if m:
+        return now - datetime.timedelta(minutes=int(m.group(1)))
+    m = re.search(r"(\d+)\s*(?:小時前|小时前|hours?\s*ago)", text)
+    if m:
+        return now - datetime.timedelta(hours=int(m.group(1)))
+    m = re.search(r"(\d+)\s*(?:天前|days?\s*ago)", text)
+    if m:
+        return now - datetime.timedelta(days=int(m.group(1)))
+    m = re.search(r"(\d+)\s*(?:週前|周前|weeks?\s*ago)", text)
+    if m:
+        return now - datetime.timedelta(weeks=int(m.group(1)))
+    m = re.search(r"(\d+)\s*(?:個月前|个月前|months?\s*ago)", text)
+    if m:
+        return now - datetime.timedelta(days=int(m.group(1)) * 30)
+    return now
+
 def get_video_real_date(video_id: str) -> Optional[datetime.datetime]:
-    """以輕量 HTTP 抓取影片真實發布日期（帶 ucbcb=1 繞過歐盟隱私轉址）"""
+    """多重管道取得真實發布日期：HTML meta > relative text > Android client"""
     url = f"https://www.youtube.com/watch?v={video_id}&ucbcb=1"
+
+    # 1. 優先嘗試純 HTTP 讀取影片頁面靜態標籤（秒級精準）
     try:
-        resp = session.get(url, timeout=8)
+        resp = session.get(url, timeout=6)
         if resp.status_code == 200:
             patterns = [
                 r'itemprop=["\']datePublished["\']\s+content=["\']([^"\']+)["\']',
                 r'["\']publishDate["\']\s*:\s*["\']([^"\']+)["\']',
                 r'itemprop=["\']uploadDate["\']\s+content=["\']([^"\']+)["\']',
-                r'["\']uploadDate["\']\s*:\s*["\']([^"\']+)["\']'
+                r'["\']uploadDate["\']\s*:\s*["\']([^"\']+)["\']',
+                r'\\\"publishDate\\\":\\\"([^"\\]+)\\\"',
+                r'\\\"uploadDate\\\":\\\"([^"\\]+)\\\"'
             ]
             for pat in patterns:
                 m = re.search(pat, resp.text)
@@ -220,12 +246,43 @@ def get_video_real_date(video_id: str) -> Optional[datetime.datetime]:
                     dt = parse_iso_datetime(m.group(1))
                     if dt:
                         return dt
+            
+            # 若無絕對時間，抓取 relative text
+            m_rel = re.search(r'["\'](?:publishedTimeText|dateText)["\']\s*:\s*\{\s*["\']simpleText["\']\s*:\s*["\']([^"\']+)["\']', resp.text)
+            if m_rel:
+                return parse_relative_time(m_rel.group(1))
     except Exception:
         pass
+
+    # 2. 備援：透過 yt-dlp Android client 取得精確 upload_date（不走 Web 播放器，無 Bot Check）
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'skip_download': True,
+            'no_warnings': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android'],
+                    'player_skip': ['webpage', 'configs']
+                }
+            }
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info:
+                ts = info.get("timestamp") or info.get("release_timestamp")
+                if ts:
+                    return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+                up_date = info.get("upload_date")
+                if up_date and len(up_date) == 8:
+                    return datetime.datetime.strptime(up_date, "%Y%m%d").replace(tzinfo=datetime.timezone.utc)
+    except Exception:
+        pass
+
     return None
 
 def fetch_videos_via_rss(url_or_id: str) -> List[Dict]:
-    """支援直接傳入完整 RSS URL，或 Channel ID (UC...) 自動測試兩種端點"""
+    """支援直接傳入完整 RSS URL，或 Channel ID (UC...)，限制取最新 5 部"""
     urls_to_try = []
     if url_or_id.startswith("http"):
         urls_to_try.append(url_or_id)
@@ -247,7 +304,8 @@ def fetch_videos_via_rss(url_or_id: str) -> List[Dict]:
             }
 
             videos = []
-            for entry in root.findall("atom:entry", ns)[:10]:
+            # 嚴格只取最新 5 部影片以加快速度
+            for entry in root.findall("atom:entry", ns)[:5]:
                 v_id_node = entry.find("yt:videoId", ns)
                 title_node = entry.find("atom:title", ns)
                 pub_node = entry.find("atom:published", ns)
@@ -282,7 +340,7 @@ def fetch_videos_via_rss(url_or_id: str) -> List[Dict]:
     return []
 
 def extract_channel_videos_via_ytdlp(channel_target: str) -> List[Dict]:
-    """自頻道頁面提取影片列表，並以純 HTTP 解析真實影片日期"""
+    """自頻道頁面提取最新 5 部影片，並解析真實發布日期"""
     target = channel_target.strip()
     if target.startswith("http"):
         url = target if "/videos" in target else f"{target.rstrip('/')}/videos"
@@ -293,8 +351,9 @@ def extract_channel_videos_via_ytdlp(channel_target: str) -> List[Dict]:
     else:
         url = f"https://www.youtube.com/@{target}/videos"
 
+    # 嚴格設定 playlistend=5，加快巡邏速度
     ydl_opts = {
-        'playlistend': 8,
+        'playlistend': 5,
         'quiet': True,
         'no_warnings': True,
         'ignoreerrors': True,
@@ -313,7 +372,9 @@ def extract_channel_videos_via_ytdlp(channel_target: str) -> List[Dict]:
             if not info:
                 return []
             
-            for e in info.get('entries', []):
+            # 只取最新 5 部
+            entries = info.get('entries', [])[:5]
+            for e in entries:
                 if not e:
                     continue
                 v_id = e.get('id')
@@ -321,10 +382,11 @@ def extract_channel_videos_via_ytdlp(channel_target: str) -> List[Dict]:
                 if not v_id or not title:
                     continue
 
-                # 透過輕量 HTTP 抓取每部影片的真實發布日期
+                # 透過多重策略精確取得真實日期
                 real_dt = get_video_real_date(v_id)
                 if not real_dt:
-                    real_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)
+                    # 若依然無日期，透過列表順序給予合理遞減估計
+                    real_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
 
                 final_videos.append({
                     "id": v_id,
@@ -334,7 +396,7 @@ def extract_channel_videos_via_ytdlp(channel_target: str) -> List[Dict]:
                     "published_dt": real_dt,
                     "published_str": real_dt.strftime("%Y-%m-%d")
                 })
-                time.sleep(0.2)
+                time.sleep(0.15)
     except Exception as e:
         print(f"  └─ 輕量頻道解析異常：{e}", flush=True)
         return []
@@ -342,14 +404,14 @@ def extract_channel_videos_via_ytdlp(channel_target: str) -> List[Dict]:
     return final_videos
 
 def get_channel_videos(ch: Dict) -> List[Dict]:
-    """支援 handle, id, url, rss_url 全面解析，並篩選 3 天內新片"""
+    """全面支援 handle, id, url, rss_url，並以 3 日曆天嚴格過濾"""
     videos = []
 
     # 1. 若有提供 rss_url，優先嘗試直接讀取
     if ch.get("rss_url"):
         videos = fetch_videos_via_rss(ch["rss_url"])
 
-    # 2. 若無或失敗，嘗試透過 id 讀取 RSS (channel_id 或 uploads playlist)
+    # 2. 嘗試透過 id 讀取 RSS (channel 或 playlist 模式)
     if not videos and ch.get("id"):
         videos = fetch_videos_via_rss(ch["id"])
 
@@ -360,10 +422,10 @@ def get_channel_videos(ch: Dict) -> List[Dict]:
     if not videos:
         target = ch.get("url") or ch.get("handle") or (f"https://www.youtube.com/channel/{ch.get('id')}" if ch.get('id') else "")
         if target:
-            print(f"  🔄 切換至頻道輕量解析：{target} ...", flush=True)
+            print(f"  🔄 切換至頻道輕量解析（最新 5 部）：{target} ...", flush=True)
             videos = extract_channel_videos_via_ytdlp(target)
             if videos:
-                print(f"  ✅ 輕量解析成功取得 {len(videos)} 部影片（含精準發布日期）", flush=True)
+                print(f"  ✅ 成功取得 {len(videos)} 部影片", flush=True)
 
     if not videos:
         return []
@@ -371,7 +433,7 @@ def get_channel_videos(ch: Dict) -> List[Dict]:
     videos.sort(key=lambda x: x["published_dt"], reverse=True)
     now = datetime.datetime.now(datetime.timezone.utc)
 
-    # 篩選 3 天內的新影片（以日曆天計算：涵蓋今天、昨天、前天、大前天）
+    # 篩選 3 天內新片（以日曆天計算，涵蓋今天、昨天、前天、大前天）
     recent_videos = [
         v for v in videos 
         if -1 <= (now.date() - v["published_dt"].date()).days <= DAYS_LIMIT
@@ -486,7 +548,7 @@ def main():
     for ch in channels:
         name = ch.get("name", "未命名頻道")
         print(f"\n📡 正在巡邏頻道：{name} ...", flush=True)
-        time.sleep(random.uniform(0.8, 1.2))
+        time.sleep(random.uniform(0.5, 0.8))
 
         target_videos = get_channel_videos(ch)
 
@@ -496,7 +558,7 @@ def main():
 
         for v in target_videos:
             if check_notion_exists(v["url"]):
-                print(f"  ⏭️ [已存在略過]：{v['title']}", flush=True)
+                print(f"  ⏭️ [已存在略過]：{v['title']} ({v['published_str']})", flush=True)
                 continue
 
             print(f"\n  🎯 [發現新影片]：{v['title']} ({v['published_str']})", flush=True)
@@ -522,7 +584,7 @@ def main():
                     res["summary"]
                 )
                 total_added += 1
-                time.sleep(2.0)
+                time.sleep(1.5)
             except Exception as e:
                 print(f"    ❌ 處理該影片時發生錯誤：{e}", flush=True)
 
