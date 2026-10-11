@@ -19,6 +19,9 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 
+# 預設追蹤 3 天內之新影片
+DAYS_LIMIT = int(os.getenv("DAYS_LOOKBACK", "3"))
+
 if not GEMINI_API_KEY or not NOTION_API_KEY or not NOTION_DATABASE_ID:
     raise ValueError("環境變數不足！請檢查 .env 或 GitHub Secrets 中的金鑰與 NOTION_DATABASE_ID！")
 
@@ -33,7 +36,8 @@ NOTION_HEADERS = {
 session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cookie": "SOCS=CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg; CONSENT=YES+1"
 })
 
 DB_SCHEMA = None
@@ -199,11 +203,11 @@ def parse_iso_datetime(dt_str: str) -> Optional[datetime.datetime]:
     return None
 
 def get_video_real_date(video_id: str) -> Optional[datetime.datetime]:
-    """透過純 HTTP 輕量取得影片真實發布日期（不透過 yt-dlp，徹底避開 Bot Check）"""
-    url = f"https://www.youtube.com/watch?v={video_id}"
+    """以輕量 HTTP 抓取影片真實發布日期（帶 ucbcb=1 繞過歐盟隱私轉址）"""
+    url = f"https://www.youtube.com/watch?v={video_id}&ucbcb=1"
     try:
         resp = session.get(url, timeout=8)
-        if resp.status_code == 200 and "consent.youtube.com" not in resp.url:
+        if resp.status_code == 200:
             patterns = [
                 r'itemprop=["\']datePublished["\']\s+content=["\']([^"\']+)["\']',
                 r'["\']publishDate["\']\s*:\s*["\']([^"\']+)["\']',
@@ -290,7 +294,7 @@ def extract_channel_videos_via_ytdlp(channel_target: str) -> List[Dict]:
         url = f"https://www.youtube.com/@{target}/videos"
 
     ydl_opts = {
-        'playlistend': 6,
+        'playlistend': 8,
         'quiet': True,
         'no_warnings': True,
         'ignoreerrors': True,
@@ -320,8 +324,7 @@ def extract_channel_videos_via_ytdlp(channel_target: str) -> List[Dict]:
                 # 透過輕量 HTTP 抓取每部影片的真實發布日期
                 real_dt = get_video_real_date(v_id)
                 if not real_dt:
-                    # 若臨時未取到，保守設定為 3 天前避免誤判為今日
-                    real_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=3)
+                    real_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)
 
                 final_videos.append({
                     "id": v_id,
@@ -339,7 +342,7 @@ def extract_channel_videos_via_ytdlp(channel_target: str) -> List[Dict]:
     return final_videos
 
 def get_channel_videos(ch: Dict) -> List[Dict]:
-    """支援 handle, id, url, rss_url 全面解析"""
+    """支援 handle, id, url, rss_url 全面解析，並篩選 3 天內新片"""
     videos = []
 
     # 1. 若有提供 rss_url，優先嘗試直接讀取
@@ -368,16 +371,16 @@ def get_channel_videos(ch: Dict) -> List[Dict]:
     videos.sort(key=lambda x: x["published_dt"], reverse=True)
     now = datetime.datetime.now(datetime.timezone.utc)
 
-    # 嚴格篩選最近 48 小時內之新影片
-    recent_2_days = [
+    # 篩選 3 天內的新影片（以日曆天計算：涵蓋今天、昨天、前天、大前天）
+    recent_videos = [
         v for v in videos 
-        if -86400 <= (now - v["published_dt"]).total_seconds() <= 172800
+        if -1 <= (now.date() - v["published_dt"].date()).days <= DAYS_LIMIT
     ]
 
-    if not recent_2_days and videos:
-        print(f"  ℹ️ 最近一部影片上架日期為：{videos[0]['published_str']}（超過 48 小時範圍）", flush=True)
+    if not recent_videos and videos:
+        print(f"  ℹ️ 最近一部影片上架日期為：{videos[0]['published_str']}（超過 {DAYS_LIMIT} 天範圍）", flush=True)
 
-    return recent_2_days
+    return recent_videos
 
 def get_transcript(video_id: str) -> Optional[str]:
     try:
@@ -488,7 +491,7 @@ def main():
         target_videos = get_channel_videos(ch)
 
         if not target_videos:
-            print("  💤 最近 2 天內無新影片，略過。", flush=True)
+            print(f"  💤 最近 {DAYS_LIMIT} 天內無新影片，略過。", flush=True)
             continue
 
         for v in target_videos:
