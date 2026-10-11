@@ -7,7 +7,7 @@ import datetime
 from typing import List, Dict, Optional
 import xml.etree.ElementTree as ET
 import requests
-import feedparser
+import yt_dlp
 from dotenv import load_dotenv
 from youtube_transcript_api import YouTubeTranscriptApi
 from google import genai
@@ -30,7 +30,6 @@ NOTION_HEADERS = {
     "Notion-Version": "2022-06-28"
 }
 
-# 乾淨的請求 Session，不放可能導致 Google 轉址的 CONSENT Cookie
 session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -200,104 +199,162 @@ def parse_iso_datetime(dt_str: str) -> Optional[datetime.datetime]:
     return None
 
 def fetch_videos_via_rss(channel_id: str) -> List[Dict]:
-    """使用原生 XML 解析 YouTube 官方 RSS，極速、秒級發布時間且 100% 免遭機器人驗證"""
-    if not channel_id:
+    """雙重 RSS 端點嘗試：1. channel_id, 2. playlist_id=UU..."""
+    if not channel_id or not channel_id.startswith("UC"):
         return []
-    rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
-    try:
-        resp = session.get(rss_url, timeout=10)
-        if resp.status_code != 200 or not resp.content:
-            print(f"  ⚠️ RSS HTTP 回應異常：{resp.status_code}", flush=True)
-            return []
 
-        # 優先使用 Python 內建 ElementTree 解析標準 Atom XML
-        root = ET.fromstring(resp.content)
-        ns = {
-            "atom": "http://www.w3.org/2005/Atom",
-            "yt": "http://www.youtube.com/xml/schemas/2015",
-            "media": "http://search.yahoo.com/mrss/"
+    urls_to_try = [
+        f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}",
+        f"https://www.youtube.com/feeds/videos.xml?playlist_id=UU{channel_id[2:]}"
+    ]
+
+    for rss_url in urls_to_try:
+        try:
+            resp = session.get(rss_url, timeout=6)
+            if resp.status_code != 200 or not resp.content:
+                continue
+
+            root = ET.fromstring(resp.content)
+            ns = {
+                "atom": "http://www.w3.org/2005/Atom",
+                "yt": "http://www.youtube.com/xml/schemas/2015",
+                "media": "http://search.yahoo.com/mrss/"
+            }
+
+            videos = []
+            for entry in root.findall("atom:entry", ns)[:10]:
+                v_id_node = entry.find("yt:videoId", ns)
+                title_node = entry.find("atom:title", ns)
+                pub_node = entry.find("atom:published", ns)
+                desc_node = entry.find("media:group/media:description", ns)
+
+                v_id = v_id_node.text.strip() if v_id_node is not None and v_id_node.text else ""
+                title = title_node.text.strip() if title_node is not None and title_node.text else ""
+                pub_str = pub_node.text.strip() if pub_node is not None and pub_node.text else ""
+                desc = desc_node.text.strip() if desc_node is not None and desc_node.text else ""
+
+                if not v_id:
+                    continue
+
+                pub_dt = parse_iso_datetime(pub_str)
+                if not pub_dt:
+                    pub_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
+
+                videos.append({
+                    "id": v_id,
+                    "title": title,
+                    "url": f"https://www.youtube.com/watch?v={v_id}",
+                    "description": desc or "",
+                    "published_dt": pub_dt,
+                    "published_str": pub_dt.strftime("%Y-%m-%d")
+                })
+
+            if videos:
+                return videos
+        except Exception:
+            continue
+
+    return []
+
+def extract_channel_videos_via_ytdlp(channel_target: str) -> List[Dict]:
+    """輕量頻道解析：直接自頻道頁面獲取時間，絕不單獨訪問影片網址，徹底避開機器人驗證"""
+    target = channel_target.strip()
+    if target.startswith("http"):
+        url = target if "/videos" in target else f"{target.rstrip('/')}/videos"
+    elif target.startswith("@"):
+        url = f"https://www.youtube.com/{target}/videos"
+    elif target.startswith("UC") and len(target) == 24:
+        url = f"https://www.youtube.com/channel/{target}/videos"
+    else:
+        url = f"https://www.youtube.com/@{target}/videos"
+
+    ydl_opts = {
+        'playlistend': 6,
+        'quiet': True,
+        'no_warnings': True,
+        'ignoreerrors': True,
+        'skip_download': True,
+        'extract_flat': True,
+        'http_headers': {
+            'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        },
+        'extractor_args': {
+            'youtube': {'lang': ['zh-TW', 'zh-Hant']},
+            'youtubetab': {'approximate_date': ['true']}
         }
-        
-        videos = []
-        for entry in root.findall("atom:entry", ns)[:10]:
-            v_id_node = entry.find("yt:videoId", ns)
-            title_node = entry.find("atom:title", ns)
-            pub_node = entry.find("atom:published", ns)
-            desc_node = entry.find("media:group/media:description", ns)
+    }
 
-            v_id = v_id_node.text.strip() if v_id_node is not None and v_id_node.text else ""
-            title = title_node.text.strip() if title_node is not None and title_node.text else ""
-            pub_str = pub_node.text.strip() if pub_node is not None and pub_node.text else ""
-            desc = desc_node.text.strip() if desc_node is not None and desc_node.text else ""
-
-            if not v_id:
-                continue
-
-            pub_dt = parse_iso_datetime(pub_str)
-            if not pub_dt:
-                pub_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
-
-            videos.append({
-                "id": v_id,
-                "title": title,
-                "url": f"https://www.youtube.com/watch?v={v_id}",
-                "description": desc or "",
-                "published_dt": pub_dt,
-                "published_str": pub_dt.strftime("%Y-%m-%d")
-            })
-            
-        return videos
-    except Exception as e:
-        print(f"  ⚠️ 原生 XML 解析異常：{e}，嘗試 feedparser 備援...", flush=True)
-
-    # 備援：feedparser
+    final_videos = []
     try:
-        feed = feedparser.parse(rss_url)
-        videos = []
-        for entry in feed.entries[:10]:
-            v_id = entry.get("yt_videoid")
-            if not v_id:
-                link = entry.get("link", "")
-                m = re.search(r'v=([a-zA-Z0-9_-]{11})', link)
-                v_id = m.group(1) if m else None
-            if not v_id:
-                continue
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if not info:
+                return []
+            
+            now = datetime.datetime.now(datetime.timezone.utc)
+            for e in info.get('entries', []):
+                if not e:
+                    continue
+                v_id = e.get('id')
+                title = e.get('title')
+                if not v_id or not title:
+                    continue
 
-            pub_str = entry.get("published", "")
-            pub_dt = parse_iso_datetime(pub_str)
-            if not pub_dt and hasattr(entry, "published_parsed") and entry.published_parsed:
-                pub_dt = datetime.datetime(*entry.published_parsed[:6], tzinfo=datetime.timezone.utc)
-            if not pub_dt:
-                pub_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
+                # 直接自列表提取時間，不進行個別網址訪問
+                ts = e.get('timestamp') or e.get('release_timestamp')
+                pub_dt = None
+                if ts:
+                    pub_dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+                elif e.get('upload_date') and len(e.get('upload_date')) == 8:
+                    try:
+                        pub_dt = datetime.datetime.strptime(e.get('upload_date'), "%Y%m%d").replace(tzinfo=datetime.timezone.utc)
+                    except Exception:
+                        pub_dt = None
 
-            videos.append({
-                "id": v_id,
-                "title": entry.get("title", ""),
-                "url": f"https://www.youtube.com/watch?v={v_id}",
-                "description": entry.get("summary", ""),
-                "published_dt": pub_dt,
-                "published_str": pub_dt.strftime("%Y-%m-%d")
-            })
-        return videos
-    except Exception:
+                # 若無時間資料，預設為當前時間以確保納入檢查
+                if not pub_dt:
+                    pub_dt = now
+
+                final_videos.append({
+                    "id": v_id,
+                    "title": title,
+                    "url": f"https://www.youtube.com/watch?v={v_id}",
+                    "description": e.get('description', '') or "",
+                    "published_dt": pub_dt,
+                    "published_str": pub_dt.strftime("%Y-%m-%d")
+                })
+    except Exception as e:
+        print(f"  └─ 輕量頻道解析異常：{e}", flush=True)
         return []
+
+    return final_videos
 
 def get_channel_videos(ch: Dict) -> List[Dict]:
     channel_id = ch.get("id")
     videos = []
-    
+
+    # 策略 1：嘗試 RSS 端點
     if channel_id and channel_id.startswith("UC"):
         videos = fetch_videos_via_rss(channel_id)
         if videos:
             print(f"  📡 RSS 成功取得 {len(videos)} 部最新影片資訊", flush=True)
 
+    # 策略 2：若 RSS 回傳 404，無縫切換到輕量頻道解析（無 Bot Check）
     if not videos:
-        print("  ⚠️ RSS 無法取得該頻道影片，略過。", flush=True)
+        target = ch.get("url") or ch.get("handle") or (f"https://www.youtube.com/channel/{channel_id}" if channel_id else "")
+        if target:
+            print(f"  🔄 RSS 回應 404，切換至輕量頻道解析：{target} ...", flush=True)
+            videos = extract_channel_videos_via_ytdlp(target)
+            if videos:
+                print(f"  ✅ 輕量解析成功取得 {len(videos)} 部影片", flush=True)
+
+    if not videos:
         return []
 
     videos.sort(key=lambda x: x["published_dt"], reverse=True)
     now = datetime.datetime.now(datetime.timezone.utc)
-    
+
     recent_2_days = [
         v for v in videos 
         if -86400 <= (now - v["published_dt"]).total_seconds() <= 172800
